@@ -1830,6 +1830,21 @@
     </testmacro>
   </target>
 
+    <target name="test-jvm-dtest-some-debug" depends="maybe-build-test" description="Execute some in-jvm dtests">
+        <testmacro inputdir="${test.distributed.src}" timeout="${test.distributed.timeout}" forkmode="once" showoutput="true">
+            <test unless:blank="${test.methods}" name="${test.name}" methods="${test.methods}" todir="${build.test.output.dir}/" outfile="TEST-${test.name}-${test.methods}"/>
+            <test if:blank="${test.methods}" name="${test.name}" todir="${build.test.output.dir}/" outfile="TEST-${test.name}"/>
+            <jvmarg value="-Dlogback.configurationFile=test/conf/logback-dtest.xml"/>
+            <jvmarg value="-Dcassandra.ring_delay_ms=10000"/>
+            <jvmarg value="-Dcassandra.tolerate_sstable_size=true"/>
+            <jvmarg value="-Dcassandra.skip_sync=true" />
+            <jvmarg value="-Dcassandra.jmx.local.port=7199" />
+            <jvmarg value="-Xmx8G"/>
+            <!-- Add debugger -->
+            <jvmarg value="-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005"/>
+        </testmacro>
+    </target>
+
   <target name="test-jvm-dtest-latest-some" depends="maybe-build-test" description="Execute some in-jvm dtests with latest configuration">
     <testmacro inputdir="${test.distributed.src}" timeout="${test.distributed.timeout}" forkmode="once" showoutput="true">
       <test unless:blank="${test.methods}" name="${test.name}" methods="${test.methods}" todir="${build.test.output.dir}/" outfile="TEST-${test.name}-${test.methods}"/>
