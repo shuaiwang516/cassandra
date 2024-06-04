@@ -910,10 +910,17 @@ public class Config
     public volatile boolean zero_ttl_on_twcs_warned = true;
     public volatile boolean zero_ttl_on_twcs_enabled = true;
     public volatile boolean non_partition_restricted_index_query_enabled = true;
-    public volatile int sai_sstable_indexes_per_query_warn_threshold = 32;
-    public volatile int sai_sstable_indexes_per_query_fail_threshold = -1;
     public volatile boolean intersect_filtering_query_warned = true;
     public volatile boolean intersect_filtering_query_enabled = true;
+
+    public volatile int sai_sstable_indexes_per_query_warn_threshold = 32;
+    public volatile int sai_sstable_indexes_per_query_fail_threshold = -1;
+    public volatile DataStorageSpec.LongBytesBound sai_string_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("1KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_string_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_frozen_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("1KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_frozen_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_vector_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("16KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_vector_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("32KiB");
 
     public volatile DurationSpec.LongNanosecondsBound streaming_state_expires = new DurationSpec.LongNanosecondsBound("3d");
     public volatile DataStorageSpec.LongBytesBound streaming_state_size = new DataStorageSpec.LongBytesBound("40MiB");
@@ -1292,12 +1299,42 @@ public class Config
      * collect enough nodes.
      */
     public volatile ConsistencyLevel progress_barrier_min_consistency_level = ConsistencyLevel.EACH_QUORUM;
-    public volatile boolean log_out_of_token_range_requests = true;
-    public volatile boolean reject_out_of_token_range_requests = true;
     public volatile ConsistencyLevel progress_barrier_default_consistency_level = ConsistencyLevel.EACH_QUORUM;
 
     public volatile DurationSpec.LongMillisecondsBound progress_barrier_timeout = new DurationSpec.LongMillisecondsBound("3600000ms");
     public volatile DurationSpec.LongMillisecondsBound progress_barrier_backoff = new DurationSpec.LongMillisecondsBound("1000ms");
     public volatile DurationSpec.LongSecondsBound discovery_timeout = new DurationSpec.LongSecondsBound("30s");
     public boolean unsafe_tcm_mode = false;
+
+    public enum TriggersPolicy
+    {
+        // Execute triggers
+        enabled,
+        // Don't execute triggers when executing queries
+        disabled,
+        // Throw an exception when attempting to execute a trigger
+        forbidden
+    }
+
+    public TriggersPolicy triggers_policy = TriggersPolicy.enabled;
+
+    /**
+     * Which timestamp should be used to represent a base for replica-side timeouts.
+     * Client-side timeout is always based on the QUEUE, and is controlled by native_transport_timeout.
+     */
+    public enum CQLStartTime
+    {
+        REQUEST, // uses a timestamp that represent the start of processing of the request
+        QUEUE    // uses a timestamp that represents when the request was enqueued
+    }
+    public volatile CQLStartTime cql_start_time = CQLStartTime.REQUEST;
+
+    public boolean native_transport_throw_on_overload = false;
+    public double native_transport_queue_max_item_age_threshold = Double.MAX_VALUE;
+    public DurationSpec.LongMillisecondsBound native_transport_min_backoff_on_queue_overload = new DurationSpec.LongMillisecondsBound("10ms");
+    public DurationSpec.LongMillisecondsBound native_transport_max_backoff_on_queue_overload = new DurationSpec.LongMillisecondsBound("200ms");
+
+    // 3.x Cassandra Driver has its "read" timeout set to 12 seconds, default matches this.
+    public DurationSpec.LongMillisecondsBound native_transport_timeout = new DurationSpec.LongMillisecondsBound("12s");
+    public boolean enforce_native_deadline_for_hints = false;
 }

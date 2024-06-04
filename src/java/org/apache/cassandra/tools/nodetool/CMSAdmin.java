@@ -160,4 +160,27 @@ public abstract class CMSAdmin extends NodeTool.NodeToolCmd
             probe.getCMSOperationsProxy().reconfigureCMS(parsedRfs);
         }
     }
+
+    @Command(name = "snapshot", description = "Request a checkpointing snapshot of cluster metadata")
+    public static class Snapshot extends NodeTool.NodeToolCmd
+    {
+        @Override
+        public void execute(NodeProbe probe)
+        {
+            probe.getCMSOperationsProxy().snapshotClusterMetadata();
+        }
+    }
+
+    @Command(name = "unregister", description = "Unregister nodes in LEFT state")
+    public static class Unregister extends NodeTool.NodeToolCmd
+    {
+        @Arguments(required = true, title = "Unregister nodes in LEFT state", description = "One or more nodeIds to unregister, they all need to be in LEFT state", usage = "<nodeId>+")
+        public List<String> nodeIds;
+
+        @Override
+        protected void execute(NodeProbe probe)
+        {
+            probe.getCMSOperationsProxy().unregisterLeftNodes(nodeIds);
+        }
+    }
 }

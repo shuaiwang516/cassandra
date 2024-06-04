@@ -78,7 +78,7 @@ import org.apache.cassandra.tcm.Commit;
 import org.apache.cassandra.tcm.Epoch;
 import org.apache.cassandra.tcm.Transformation;
 import org.apache.cassandra.tcm.membership.NodeId;
-import org.apache.cassandra.tcm.ownership.PlacementForRange;
+import org.apache.cassandra.tcm.ownership.ReplicaGroups;
 import org.apache.cassandra.utils.Isolated;
 import org.apache.cassandra.utils.concurrent.AsyncPromise;
 import org.apache.cassandra.utils.concurrent.CountDownLatch;
@@ -388,7 +388,7 @@ public class ClusterUtils
             StringBuilder builder = new StringBuilder();
             builder.append("'keyspace' { 'name':").append(keyspace.name).append("', ");
             builder.append("'reads':['");
-            PlacementForRange placement = metadata.placements.get(keyspace.params.replication).reads;
+            ReplicaGroups placement = metadata.placements.get(keyspace.params.replication).reads;
             builder.append(byEndpoint ? placement.toStringByEndpoint() : placement.toString());
             builder.append("'], 'writes':['");
             placement = metadata.placements.get(keyspace.params.replication).writes;
@@ -545,6 +545,8 @@ public class ClusterUtils
 
     public static void unpauseCommits(IInvokableInstance instance)
     {
+        if (instance.isShutdown())
+            return;
         instance.runOnInstance(() -> {
             TestProcessor processor = (TestProcessor) ((ClusterMetadataService.SwitchableProcessor) ClusterMetadataService.instance().processor()).delegate();
             processor.unpause();
@@ -628,6 +630,14 @@ public class ClusterUtils
     public static Epoch getNextEpoch(IInvokableInstance inst)
     {
         return decode(inst.callOnInstance(() -> encode(ClusterMetadata.current().nextEpoch())));
+    }
+
+    public static Epoch snapshotClusterMetadata(IInvokableInstance inst)
+    {
+        return decode(inst.callOnInstance(() -> {
+            ClusterMetadata snapshotted = ClusterMetadataService.instance().triggerSnapshot();
+            return encode(snapshotted.epoch);
+        }));
     }
 
     public static Map<String, Epoch> getPeerEpochs(IInvokableInstance requester)

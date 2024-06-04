@@ -998,6 +998,15 @@ public class DatabaseDescriptor
             throw new ConfigurationException(String.format("Invalid value for.progress_barrier_default_consistency_level %s. Allowed values: %s",
                                                            conf.progress_barrier_default_consistency_level, progressBarrierCLsArr));
         }
+
+        if (conf.native_transport_min_backoff_on_queue_overload.toMilliseconds() <= 0)
+            throw new ConfigurationException(" be positive");
+
+        if (conf.native_transport_min_backoff_on_queue_overload.toMilliseconds() >= conf.native_transport_max_backoff_on_queue_overload.toMilliseconds())
+            throw new ConfigurationException(String.format("native_transport_min_backoff_on_queue_overload should be strictly less than native_transport_max_backoff_on_queue_overload, but %s >= %s",
+                                                           conf.native_transport_min_backoff_on_queue_overload,
+                                                           conf.native_transport_max_backoff_on_queue_overload));
+
     }
 
     @VisibleForTesting
@@ -2256,6 +2265,100 @@ public class DatabaseDescriptor
                          getWriteRpcTimeout(unit),
                          getCounterWriteRpcTimeout(unit),
                          getTruncateRpcTimeout(unit));
+    }
+
+    public static Config.CQLStartTime getCQLStartTime()
+    {
+        return conf.cql_start_time;
+    }
+
+    public static void setCQLStartTime(Config.CQLStartTime value)
+    {
+        conf.cql_start_time = value;
+    }
+
+    /**
+     * How much time the item is allowed to spend in (currently only Native) queue, compared to {@link #nativeTransportIdleTimeout()},
+     * before backpressure starts being applied.
+     *
+     * For example, setting this value to 0.5 means and having the largest of read/range/write/counter timeouts to 10 seconds
+     * means that if any item spends more than 5 seconds in the queue, backpressure will be applied to the socket associated
+     * with this queue.
+     *
+     * Set to 0 or any negative value to fully disable.
+     */
+    public static double getNativeTransportQueueMaxItemAgeThreshold()
+    {
+        return conf.native_transport_queue_max_item_age_threshold;
+    }
+
+    public static void setNativeTransportMaxQueueItemAgeThreshold(double threshold)
+    {
+        conf.native_transport_queue_max_item_age_threshold = threshold;
+    }
+
+    public static long getNativeTransportMinBackoffOnQueueOverload(TimeUnit timeUnit)
+    {
+        return conf.native_transport_min_backoff_on_queue_overload.to(timeUnit);
+    }
+
+    public static long getNativeTransportMaxBackoffOnQueueOverload(TimeUnit timeUnit)
+    {
+        return conf.native_transport_max_backoff_on_queue_overload.to(timeUnit);
+    }
+
+    public static void setNativeTransportBackoffOnQueueOverload(long minBackoffMillis,
+                                                                long maxBackoffMillis,
+                                                                TimeUnit timeUnit)
+    {
+        if (minBackoffMillis <= 0)
+            throw new IllegalArgumentException("native_transport_min_backoff_on_queue_overload should be positive");
+
+        if (minBackoffMillis >= maxBackoffMillis)
+            throw new IllegalArgumentException(String.format("native_transport_max_backoff_on_queue_overload should be greater than native_transport_min_backoff_on_queue_overload, but %s >= %s", minBackoffMillis, maxBackoffMillis));
+
+
+        conf.native_transport_min_backoff_on_queue_overload = new DurationSpec.LongMillisecondsBound(minBackoffMillis, timeUnit);
+        conf.native_transport_max_backoff_on_queue_overload = new DurationSpec.LongMillisecondsBound(maxBackoffMillis, timeUnit);
+    }
+
+    private static long native_transport_timeout_nanos_cached = -1;
+
+    public static long getNativeTransportTimeout(TimeUnit timeUnit)
+    {
+        if (timeUnit == TimeUnit.NANOSECONDS)
+        {
+            if (native_transport_timeout_nanos_cached == -1)
+                native_transport_timeout_nanos_cached = conf.native_transport_timeout.to(TimeUnit.NANOSECONDS);
+
+            return native_transport_timeout_nanos_cached;
+        }
+        return conf.native_transport_timeout.to(timeUnit);
+    }
+
+    public static void setNativeTransportTimeout(long dealine, TimeUnit timeUnit)
+    {
+        conf.native_transport_timeout = new DurationSpec.LongMillisecondsBound(dealine, timeUnit);
+    }
+
+    public static boolean getEnforceNativeDeadlineForHints()
+    {
+        return conf.enforce_native_deadline_for_hints;
+    }
+
+    public static void setEnforceNativeDeadlineForHints(boolean value)
+    {
+        conf.enforce_native_deadline_for_hints = value;
+    }
+
+    public static boolean getNativeTransportThrowOnOverload()
+    {
+        return conf.native_transport_throw_on_overload;
+    }
+
+    public static void setNativeTransportThrowOnOverload(boolean throwOnOverload)
+    {
+        conf.native_transport_throw_on_overload = throwOnOverload;
     }
 
     public static long getPingTimeout(TimeUnit unit)
@@ -3519,6 +3622,11 @@ public class DatabaseDescriptor
     public static long getMaxHintsFileSize()
     {
         return conf.max_hints_file_size.toBytesInLong();
+    }
+
+    public static void setMaxHintsFileSize(long value)
+    {
+        conf.max_hints_file_size = new DataStorageSpec.IntMebibytesBound(value);
     }
 
     public static ParameterizedClass getHintsCompression()
@@ -5089,26 +5197,6 @@ public class DatabaseDescriptor
         conf.progress_barrier_min_consistency_level = newLevel;
     }
 
-    public static boolean getLogOutOfTokenRangeRequests()
-    {
-        return conf.log_out_of_token_range_requests;
-    }
-
-    public static void setLogOutOfTokenRangeRequests(boolean enabled)
-    {
-        conf.log_out_of_token_range_requests = enabled;
-    }
-
-    public static boolean getRejectOutOfTokenRangeRequests()
-    {
-        return conf.reject_out_of_token_range_requests;
-    }
-
-    public static void setRejectOutOfTokenRangeRequests(boolean enabled)
-    {
-        conf.reject_out_of_token_range_requests = enabled;
-    }
-
     public static ConsistencyLevel getProgressBarrierDefaultConsistencyLevel()
     {
         return conf.progress_barrier_default_consistency_level;
@@ -5152,5 +5240,17 @@ public class DatabaseDescriptor
     public static int getSaiSSTableIndexesPerQueryFailThreshold()
     {
         return conf.sai_sstable_indexes_per_query_fail_threshold;
+    }
+
+    @VisibleForTesting
+    public static void setTriggersPolicy(Config.TriggersPolicy policy)
+    {
+        logger.info("triggers_policy set to {}", policy);
+        conf.triggers_policy = policy;
+    }
+
+    public static Config.TriggersPolicy getTriggersPolicy()
+    {
+        return conf.triggers_policy;
     }
 }

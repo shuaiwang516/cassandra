@@ -263,7 +263,7 @@ public abstract class LocalLog implements Closeable
         if (spec.initial == null)
             spec.initial = new ClusterMetadata(DatabaseDescriptor.getPartitioner());
         if (spec.prev == null)
-            spec.prev = new ClusterMetadata(DatabaseDescriptor.getPartitioner());
+            spec.prev = new ClusterMetadata(spec.initial.partitioner);
         assert spec.initial.epoch.is(EMPTY) || spec.initial.epoch.is(Epoch.UPGRADE_STARTUP) || spec.isReset :
         String.format(String.format("Should start with empty epoch, unless we're in upgrade or reset mode: %s (isReset: %s)", spec.initial, spec.isReset));
 
@@ -338,7 +338,7 @@ public abstract class LocalLog implements Closeable
 
     public LogState getCommittedEntries(Epoch since)
     {
-        return storage.getLogState(committed.get().period, since);
+        return storage.getLogState(since);
     }
 
     public ClusterMetadata waitForHighestConsecutive()
@@ -480,8 +480,10 @@ public abstract class LocalLog implements Closeable
                     String.format("Epoch %s for %s can either force snapshot, or immediately follow %s",
                                   next.epoch, pendingEntry.transform, prev.epoch);
 
-                    if (replayComplete.get())
-                        storage.append(transformed.success().metadata.period, pendingEntry.maybeUnwrapExecuted());
+                    // If replay during initialisation has completed persist to local storage unless the entry is
+                    // a synthetic ForceSnapshot which is not a replicated event but enables jumping over gaps
+                    if (replayComplete.get() && pendingEntry.transform.kind() != Transformation.Kind.FORCE_SNAPSHOT)
+                        storage.append(pendingEntry.maybeUnwrapExecuted());
 
                     notifyPreCommit(prev, next, isSnapshot);
 
@@ -887,7 +889,7 @@ public abstract class LocalLog implements Closeable
                 List<InetAddressAndPort> list = new ArrayList<>(ClusterMetadata.current().fullCMSMembers());
                 list.sort(comparing(i -> i.addressBytes[i.addressBytes.length - 1]));
                 if (list.get(0).equals(FBUtilities.getBroadcastAddressAndPort()))
-                    ScheduledExecutors.nonPeriodicTasks.submit(() -> ClusterMetadataService.instance().sealPeriod());
+                    ScheduledExecutors.nonPeriodicTasks.submit(() -> ClusterMetadataService.instance().triggerSnapshot());
             }
         };
     }

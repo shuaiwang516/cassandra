@@ -20,9 +20,12 @@ package org.apache.cassandra.tcm.ownership;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Maps;
 
 import org.apache.cassandra.dht.IPartitioner;
@@ -39,34 +42,62 @@ import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.locator.ReplicaCollection;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.tcm.Epoch;
-import org.apache.cassandra.tcm.serialization.MetadataSerializer;
+import org.apache.cassandra.tcm.serialization.PartitionerAwareMetadataSerializer;
 import org.apache.cassandra.tcm.serialization.Version;
+import org.apache.cassandra.utils.AsymmetricOrdering;
 
 import static org.apache.cassandra.db.TypeSizes.sizeof;
 
-public class PlacementForRange
+public class ReplicaGroups
 {
+    private static final AsymmetricOrdering<Range<Token>, Token> ordering = new AsymmetricOrdering<>()
+    {
+        @Override
+        public int compare(Range<Token> left, Range<Token> right)
+        {
+            return left.compareTo(right);
+        }
+
+        @Override
+        public int compareAsymmetric(Range<Token> range, Token token)
+        {
+            if (token.isMinimum() && !range.right.isMinimum())
+                return -1;
+            if (range.left.compareTo(token) >= 0)
+                return 1;
+            if (!range.right.isMinimum() && range.right.compareTo(token) < 0)
+                return -1;
+            return 0;
+        }
+    };
+
     public static final Serializer serializer = new Serializer();
+    public static final ReplicaGroups EMPTY = ReplicaGroups.builder().build();
 
-    public static final PlacementForRange EMPTY = PlacementForRange.builder().build();
+    public final ImmutableList<Range<Token>> ranges;
+    public final ImmutableList<VersionedEndpoints.ForRange> endpoints;
 
-    final SortedMap<Range<Token>, VersionedEndpoints.ForRange> replicaGroups;
-
-    public PlacementForRange(Map<Range<Token>, VersionedEndpoints.ForRange> replicaGroups)
+    public ReplicaGroups(Map<Range<Token>, VersionedEndpoints.ForRange> replicaGroups)
     {
-        this.replicaGroups = new TreeMap<>(replicaGroups);
-    }
-
-    @VisibleForTesting
-    public Map<Range<Token>, VersionedEndpoints.ForRange> replicaGroups()
-    {
-        return Collections.unmodifiableMap(replicaGroups);
+        ImmutableList.Builder<Range<Token>> rangesBuilder = ImmutableList.builderWithExpectedSize(replicaGroups.size());
+        ImmutableList.Builder<VersionedEndpoints.ForRange> endpointsBuilder = ImmutableList.builderWithExpectedSize(replicaGroups.size());
+        Range<Token> prev = null;
+        for (Map.Entry<Range<Token>, VersionedEndpoints.ForRange> entry : ImmutableSortedMap.copyOf(replicaGroups, Comparator.comparing(o -> o.left)).entrySet())
+        {
+            if (prev != null && prev.right.compareTo(entry.getKey().left) > 0 )
+                throw new IllegalArgumentException("Got overlapping ranges in replica groups: " + replicaGroups);
+            prev = entry.getKey();
+            rangesBuilder.add(entry.getKey());
+            endpointsBuilder.add(entry.getValue());
+        }
+        this.ranges = rangesBuilder.build();
+        this.endpoints = endpointsBuilder.build();
     }
 
     @VisibleForTesting
     public List<Range<Token>> ranges()
     {
-        List<Range<Token>> ranges = new ArrayList<>(replicaGroups.keySet());
+        List<Range<Token>> ranges = new ArrayList<>(this.ranges);
         ranges.sort(Range::compareTo);
         return ranges;
     }
@@ -76,7 +107,11 @@ public class PlacementForRange
     {
         // can't use range.isWrapAround() since range.unwrap() returns a wrapping range (right token is min value)
         assert range.right.compareTo(range.left) > 0 || range.right.equals(range.right.minValue());
-        return replicaGroups.get(range);
+        // we're searching for an exact match to the input range here, can use standard binary search
+        int pos = Collections.binarySearch(ranges, range, Comparator.comparing(o -> o.left));
+        if (pos >= 0 && pos < ranges.size() && ranges.get(pos).equals(range))
+            return endpoints.get(pos);
+        return null;
     }
 
     /**
@@ -86,40 +121,32 @@ public class PlacementForRange
     {
         EndpointsForRange.Builder builder = new EndpointsForRange.Builder(range);
         Epoch lastModified = Epoch.EMPTY;
-
-        for (Map.Entry<Range<Token>, VersionedEndpoints.ForRange> entry : replicaGroups.entrySet())
+        // find a range containing the *right* token for the given range - Range is start exclusive so if we looked for the
+        // left one we could get the wrong range
+        int pos = ordering.binarySearchAsymmetric(ranges, range.right, AsymmetricOrdering.Op.CEIL);
+        if (pos >= 0 && pos < ranges.size() && ranges.get(pos).contains(range))
         {
-            if (entry.getKey().contains(range))
-            {
-                lastModified = Epoch.max(lastModified, entry.getValue().lastModified());
-                builder.addAll(entry.getValue().get(), ReplicaCollection.Builder.Conflict.ALL);
-            }
+            VersionedEndpoints.ForRange eps = endpoints.get(pos);
+            lastModified = eps.lastModified();
+            builder.addAll(eps.get(), ReplicaCollection.Builder.Conflict.ALL);
         }
-
         return VersionedEndpoints.forRange(lastModified, builder.build());
     }
 
     public VersionedEndpoints.ForRange forRange(Token token)
     {
-        for (Map.Entry<Range<Token>, VersionedEndpoints.ForRange> entry : replicaGroups.entrySet())
-        {
-            if (entry.getKey().contains(token))
-                return entry.getValue();
-        }
-        throw new IllegalStateException("Could not find range for token " + token + " in PlacementForRange: " + replicaGroups);
+        int pos = ordering.binarySearchAsymmetric(ranges, token, AsymmetricOrdering.Op.CEIL);
+        if (pos >= 0 && pos < endpoints.size())
+            return endpoints.get(pos);
+        throw new IllegalStateException("Could not find range for token " + token + " in ReplicaGroups: " + this);
     }
 
     public VersionedEndpoints.ForToken forToken(Token token)
     {
-        for (Map.Entry<Range<Token>, VersionedEndpoints.ForRange> entry : replicaGroups.entrySet())
-        {
-            if (entry.getKey().contains(token))
-                return entry.getValue().forToken(token);
-        }
-        throw new IllegalStateException("Could not find range for token " + token + " in PlacementForRange: " + replicaGroups);
+        return forRange(token).forToken(token);
     }
 
-    public Delta difference(PlacementForRange next)
+    public Delta difference(ReplicaGroups next)
     {
         RangesByEndpoint oldMap = this.byEndpoint();
         RangesByEndpoint newMap = next.byEndpoint();
@@ -130,8 +157,8 @@ public class PlacementForRange
     public RangesByEndpoint byEndpoint()
     {
         RangesByEndpoint.Builder builder = new RangesByEndpoint.Builder();
-        for (Map.Entry<Range<Token>, VersionedEndpoints.ForRange> oldPlacement : this.replicaGroups.entrySet())
-            oldPlacement.getValue().byEndpoint().forEach(builder::put);
+        for (int i = 0; i < endpoints.size(); i++)
+            endpoints.get(i).byEndpoint().forEach(builder::put);
         return builder.build();
     }
 
@@ -152,10 +179,52 @@ public class PlacementForRange
         return builder.build();
     }
 
+    public ReplicaGroups withCappedLastModified(Epoch lastModified)
+    {
+        SortedMap<Range<Token>, VersionedEndpoints.ForRange> copy = new TreeMap<>();
+        for (int i = 0; i < ranges.size(); i++)
+        {
+            Range<Token> range = ranges.get(i);
+            VersionedEndpoints.ForRange forRange = endpoints.get(i);
+            if (forRange.lastModified().isAfter(lastModified))
+                forRange = forRange.withLastModified(lastModified);
+            copy.put(range, forRange);
+        }
+        return new ReplicaGroups(copy);
+    }
+
+
+    public int size()
+    {
+        return ranges.size();
+    }
+
+    public boolean isEmpty()
+    {
+        return size() == 0;
+    }
+
+    @VisibleForTesting
+    public Map<Range<Token>, VersionedEndpoints.ForRange> asMap()
+    {
+        Map<Range<Token>, VersionedEndpoints.ForRange> map = new HashMap<>();
+        for (int i = 0; i < size(); i++)
+            map.put(ranges.get(i), endpoints.get(i));
+        return map;
+    }
+
+    public void forEach(BiConsumer<Range<Token>, VersionedEndpoints.ForRange> consumer)
+    {
+        for (int i = 0; i < size(); i++)
+            consumer.accept(ranges.get(i), endpoints.get(i));
+    }
+
     @Override
     public String toString()
     {
-        return replicaGroups.toString();
+        StringBuilder sb = new StringBuilder("ReplicaGroups{");
+        forEach((range, eps) -> sb.append(range).append('=').append(eps).append(", "));
+        return sb.append('}').toString();
     }
 
     @VisibleForTesting
@@ -170,17 +239,16 @@ public class PlacementForRange
     @VisibleForTesting
     public List<String> toReplicaStringList()
     {
-        return replicaGroups.values()
-                            .stream()
-                            .map(VersionedEndpoints.ForRange::get)
-                            .flatMap(AbstractReplicaCollection::stream)
-                            .map(Replica::toString)
-                            .collect(Collectors.toList());
+        return endpoints.stream()
+                        .map(VersionedEndpoints.ForRange::get)
+                        .flatMap(AbstractReplicaCollection::stream)
+                        .map(Replica::toString)
+                        .collect(Collectors.toList());
     }
 
     public Builder unbuild()
     {
-        return new Builder(new HashMap<>(replicaGroups));
+        return new Builder(asMap());
     }
 
     public static Builder builder()
@@ -194,13 +262,13 @@ public class PlacementForRange
     }
 
     @VisibleForTesting
-    public static PlacementForRange splitRangesForPlacement(List<Token> tokens, PlacementForRange placement)
+    public static ReplicaGroups splitRangesForPlacement(List<Token> tokens, ReplicaGroups placement)
     {
-        if (placement.replicaGroups.isEmpty())
+        if (placement.ranges.isEmpty())
             return placement;
 
-        Builder newPlacement = PlacementForRange.builder();
-        List<VersionedEndpoints.ForRange> eprs = new ArrayList<>(placement.replicaGroups.values());
+        Builder newPlacement = ReplicaGroups.builder();
+        List<VersionedEndpoints.ForRange> eprs = new ArrayList<>(placement.endpoints);
         eprs.sort(Comparator.comparing(a -> a.range().left));
         Token min = eprs.get(0).range().left;
         Token max = eprs.get(eprs.size() - 1).range().right;
@@ -307,15 +375,49 @@ public class PlacementForRange
                                                (t, v) -> {
                                                    EndpointsForRange old = v.get();
                                                    return VersionedEndpoints.forRange(Epoch.max(v.lastModified(), replicas.lastModified()),
-                                                                                      replicas.get()
-                                                                                              .newBuilder(replicas.size() + old.size())
-                                                                                              .addAll(old)
-                                                                                              .addAll(replicas.get(), ReplicaCollection.Builder.Conflict.ALL)
-                                                                                              .build());
+                                                                                      combine(old, replicas.get()));
                                                });
             if (group == null)
                 replicaGroups.put(replicas.range(), replicas);
             return this;
+        }
+
+        /**
+         * Combine two replica groups, assuming one is the current group and the other is the proposed.
+         * During range movements this is used when calculating the maximal placement, which combines the current and
+         * future replica groups. This special cases the merging of two replica groups to make sure that when a replica
+         * moves from transient to full, it starts to act as a FULL write replica as early as possible.
+         *
+         * Where an endpoint is present in both groups, prefer the proposed iff it is a FULL replica. During a
+         * multi-step operation (join/leave/move), we want any change from transient to full to happen as early
+         * as possible so that a replica whose ownership is modified in this way becomes FULL for writes before it
+         * becomes FULL for reads. This works as additions to write replica groups are applied before any other
+         * placement changes (i.e. in START_[JOIN|LEAVE|MOVE]).
+         *
+         * @param prev Initial set of replicas for a given range
+         * @param next Proposed set of replicas for the same range.
+         * @return The union of the two groups
+         */
+        private EndpointsForRange combine(EndpointsForRange prev, EndpointsForRange next)
+        {
+            Map<InetAddressAndPort, Replica> e1 = prev.byEndpoint();
+            Map<InetAddressAndPort, Replica> e2 = next.byEndpoint();
+            EndpointsForRange.Builder combined = prev.newBuilder(prev.size() + next.size());
+            e1.forEach((e, r1) -> {
+                Replica r2 = e2.get(e);
+                if (null == r2)          // not present in next
+                    combined.add(r1);
+                else if (r2.isFull())    // prefer replica from next, if it is moving from transient to full
+                    combined.add(r2);
+                else
+                    combined.add(r1);    // replica is moving from full to transient, or staying the same
+            });
+            // any new replicas not in prev
+            e2.forEach((e, r2) -> {
+                if (!combined.contains(e))
+                    combined.add(r2);
+            });
+            return combined.build();
         }
 
         public Builder withReplicaGroups(Iterable<VersionedEndpoints.ForRange> replicas)
@@ -324,43 +426,42 @@ public class PlacementForRange
             return this;
         }
 
-        public PlacementForRange build()
+        public ReplicaGroups build()
         {
-            return new PlacementForRange(this.replicaGroups);
+            return new ReplicaGroups(this.replicaGroups);
         }
     }
 
-    public static class Serializer implements MetadataSerializer<PlacementForRange>
+    public static class Serializer implements PartitionerAwareMetadataSerializer<ReplicaGroups>
     {
-        public void serialize(PlacementForRange t, DataOutputPlus out, Version version) throws IOException
+        public void serialize(ReplicaGroups t, DataOutputPlus out, IPartitioner partitioner, Version version) throws IOException
         {
-            out.writeInt(t.replicaGroups.size());
+            out.writeInt(t.ranges.size());
 
-            for (Map.Entry<Range<Token>, VersionedEndpoints.ForRange> entry : t.replicaGroups.entrySet())
+            for (int i = 0; i < t.ranges.size(); i++)
             {
-                Range<Token> range = entry.getKey();
-                VersionedEndpoints.ForRange efr = entry.getValue();
+                Range<Token> range = t.ranges.get(i);
+                VersionedEndpoints.ForRange efr = t.endpoints.get(i);
                 if (version.isAtLeast(Version.V2))
                     Epoch.serializer.serialize(efr.lastModified(), out, version);
-                Token.metadataSerializer.serialize(range.left, out, version);
-                Token.metadataSerializer.serialize(range.right, out, version);
+                Token.metadataSerializer.serialize(range.left, out, partitioner, version);
+                Token.metadataSerializer.serialize(range.right, out, partitioner, version);
                 out.writeInt(efr.size());
-                for (int i = 0; i < efr.size(); i++)
+                for (int efrIdx = 0; efrIdx < efr.size(); efrIdx++)
                 {
-                    Replica r = efr.get().get(i);
-                    Token.metadataSerializer.serialize(r.range().left, out, version);
-                    Token.metadataSerializer.serialize(r.range().right, out, version);
+                    Replica r = efr.get().get(efrIdx);
+                    Token.metadataSerializer.serialize(r.range().left, out, partitioner, version);
+                    Token.metadataSerializer.serialize(r.range().right, out, partitioner, version);
                     InetAddressAndPort.MetadataSerializer.serializer.serialize(r.endpoint(), out, version);
                     out.writeBoolean(r.isFull());
                 }
             }
         }
 
-        public PlacementForRange deserialize(DataInputPlus in, Version version) throws IOException
+        public ReplicaGroups deserialize(DataInputPlus in, IPartitioner partitioner, Version version) throws IOException
         {
             int groupCount = in.readInt();
             Map<Range<Token>, VersionedEndpoints.ForRange> result = Maps.newHashMapWithExpectedSize(groupCount);
-            IPartitioner partitioner = ClusterMetadata.current().partitioner;
             for (int i = 0; i < groupCount; i++)
             {
                 Epoch lastModified;
@@ -391,27 +492,27 @@ public class PlacementForRange
                 EndpointsForRange efr = EndpointsForRange.copyOf(replicas);
                 result.put(range, VersionedEndpoints.forRange(lastModified, efr));
             }
-            return new PlacementForRange(result);
+            return new ReplicaGroups(result);
         }
 
-        public long serializedSize(PlacementForRange t, Version version)
+        public long serializedSize(ReplicaGroups t, IPartitioner partitioner, Version version)
         {
-            int size = sizeof(t.replicaGroups.size());
-            for (Map.Entry<Range<Token>, VersionedEndpoints.ForRange> entry : t.replicaGroups.entrySet())
+            long size = sizeof(t.ranges.size());
+            for (int i = 0; i < t.ranges.size(); i++)
             {
-                Range<Token> range = entry.getKey();
-                VersionedEndpoints.ForRange efr = entry.getValue();
+                Range<Token> range = t.ranges.get(i);
+                VersionedEndpoints.ForRange efr = t.endpoints.get(i);
 
                 if (version.isAtLeast(Version.V2))
                     size += Epoch.serializer.serializedSize(efr.lastModified(), version);
-                size += Token.metadataSerializer.serializedSize(range.left, version);
-                size += Token.metadataSerializer.serializedSize(range.right, version);
+                size += Token.metadataSerializer.serializedSize(range.left, partitioner, version);
+                size += Token.metadataSerializer.serializedSize(range.right, partitioner, version);
                 size += sizeof(efr.size());
-                for (int i = 0; i < efr.size(); i++)
+                for (int efrIdx = 0; efrIdx < efr.size(); efrIdx++)
                 {
-                    Replica r = efr.get().get(i);
-                    size += Token.metadataSerializer.serializedSize(r.range().left, version);
-                    size += Token.metadataSerializer.serializedSize(r.range().right, version);
+                    Replica r = efr.get().get(efrIdx);
+                    size += Token.metadataSerializer.serializedSize(r.range().left, partitioner, version);
+                    size += Token.metadataSerializer.serializedSize(r.range().right, partitioner, version);
                     size += InetAddressAndPort.MetadataSerializer.serializer.serializedSize(r.endpoint(), version);
                     size += sizeof(r.isFull());
                 }
@@ -424,14 +525,14 @@ public class PlacementForRange
     public boolean equals(Object o)
     {
         if (this == o) return true;
-        if (!(o instanceof PlacementForRange)) return false;
-        PlacementForRange that = (PlacementForRange) o;
-        return Objects.equals(replicaGroups, that.replicaGroups);
+        if (!(o instanceof ReplicaGroups)) return false;
+        ReplicaGroups that = (ReplicaGroups) o;
+        return Objects.equals(ranges, that.ranges) && Objects.equals(endpoints, that.endpoints);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hash(replicaGroups);
+        return Objects.hash(ranges, endpoints);
     }
 }

@@ -16,18 +16,27 @@
  * limitations under the License.
  */
 
-package org.apache.cassandra.tools.nodetool;
+package org.apache.cassandra.utils.asserts;
 
-import io.airlift.airline.Command;
-import org.apache.cassandra.tools.NodeProbe;
-import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
+import java.util.concurrent.atomic.AtomicInteger;
 
-@Command(name = "sealperiod", description = "seal current period in the metadata log")
-public class SealPeriod extends NodeToolCmd
+import org.assertj.core.api.SoftAssertions;
+
+public class SoftAssertionsWithLimit extends SoftAssertions
 {
-    @Override
-    public void execute(NodeProbe probe)
+    private final AtomicInteger counter = new AtomicInteger();
+    private final int limit;
+
+    public SoftAssertionsWithLimit(int limit)
     {
-        probe.getCMSOperationsProxy().sealPeriod();
+        this.limit = limit;
+    }
+
+    @Override
+    public void onAssertionErrorCollected(AssertionError assertionError)
+    {
+        super.onAssertionErrorCollected(assertionError);
+        if (counter.incrementAndGet() >= limit)
+            assertAll();
     }
 }

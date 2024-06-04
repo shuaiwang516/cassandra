@@ -76,6 +76,7 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.pager.SinglePartitionPager;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.ProtocolVersion;
@@ -1145,14 +1146,15 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         int pageSize = (int) Math.max(1, Math.min(DEFAULT_PAGE_SIZE, targetPageSizeInBytes / meanRowSize));
 
-        logger.trace("Calculated page size {} for indexing {}.{} ({}/{}/{}/{})",
-                     pageSize,
-                     baseCfs.metadata.keyspace,
-                     baseCfs.metadata.name,
-                     meanPartitionSize,
-                     meanCellsPerPartition,
-                     meanRowsPerPartition,
-                     meanRowSize);
+        if (logger.isTraceEnabled())
+            logger.trace("Calculated page size {} for indexing {}.{} ({}/{}/{}/{})",
+                         pageSize,
+                         baseCfs.metadata.keyspace,
+                         baseCfs.metadata.name,
+                         meanPartitionSize,
+                         meanCellsPerPartition,
+                         meanRowsPerPartition,
+                         meanRowSize);
 
         return pageSize;
     }
@@ -1296,11 +1298,13 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * implementations
      *
      * @param update PartitionUpdate containing the values to be validated by registered Index implementations
+     * @param state state related to the client connection
      */
-    public void validate(PartitionUpdate update) throws InvalidRequestException
+    @Override
+    public void validate(PartitionUpdate update, ClientState state) throws InvalidRequestException
     {
         for (Index index : indexes.values())
-            index.validate(update);
+            index.validate(update, state);
     }
 
     /*

@@ -16,10 +16,14 @@
  * limitations under the License.
  */
 
-package org.apache.cassandra.tcm;
+package org.apache.cassandra.triggers;
 
-public class Period
+import org.apache.cassandra.exceptions.InvalidRequestException;
+
+public class TriggerDisabledException extends InvalidRequestException
 {
-    public static final long EMPTY = 0;
-    public static final long FIRST = 1;
+    public TriggerDisabledException(String message)
+    {
+        super(message);
+    }
 }

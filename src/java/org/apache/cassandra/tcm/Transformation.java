@@ -170,7 +170,7 @@ public interface Transformation
         PRE_INITIALIZE_CMS(0, () -> PreInitialize.serializer),
         INITIALIZE_CMS(1, () -> Initialize.serializer),
         FORCE_SNAPSHOT(2, () -> ForceSnapshot.serializer),
-        SEAL_PERIOD(3, () -> SealPeriod.serializer),
+        TRIGGER_SNAPSHOT(3, () -> TriggerSnapshot.serializer),
         SCHEMA_CHANGE(4, () -> AlterSchema.serializer),
         REGISTER(5, () -> Register.serializer),
         UNREGISTER(6, () -> Unregister.serializer),
@@ -217,7 +217,7 @@ public interface Transformation
         ;
 
         private final Supplier<AsymmetricMetadataSerializer<Transformation, ? extends Transformation>> serializer;
-        private final int id;
+        public final int id;
 
         private static final Kind[] idToKindMap;
 

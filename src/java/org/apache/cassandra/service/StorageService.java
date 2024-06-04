@@ -146,6 +146,7 @@ import org.apache.cassandra.locator.EndpointsForToken;
 import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.LocalStrategy;
+import org.apache.cassandra.locator.MetaStrategy;
 import org.apache.cassandra.locator.RangesAtEndpoint;
 import org.apache.cassandra.locator.RangesByEndpoint;
 import org.apache.cassandra.locator.Replica;
@@ -255,6 +256,7 @@ import static org.apache.cassandra.tcm.membership.NodeState.BOOTSTRAPPING;
 import static org.apache.cassandra.tcm.membership.NodeState.BOOT_REPLACING;
 import static org.apache.cassandra.tcm.membership.NodeState.JOINED;
 import static org.apache.cassandra.tcm.membership.NodeState.MOVING;
+import static org.apache.cassandra.tcm.membership.NodeState.REGISTERED;
 import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
 import static org.apache.cassandra.utils.FBUtilities.now;
@@ -444,7 +446,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     private boolean isSurveyMode = TEST_WRITE_SURVEY.getBoolean(false);
     /* true if node is rebuilding and receiving data */
     private volatile boolean initialized = false;
-    private final AtomicBoolean authSetupCalled = new AtomicBoolean(false);
+    private final AtomicBoolean authSetupCalled = new AtomicBoolean(CassandraRelevantProperties.SKIP_AUTH_SETUP.getBoolean());
     private volatile boolean authSetupComplete = false;
 
     /* the probability for tracing any particular request, 0 disables tracing and 1 enables for all */
@@ -584,13 +586,13 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         }
     }
 
-    public void stopNativeTransport()
+    public void stopNativeTransport(boolean force)
     {
         if (daemon == null)
         {
             throw new IllegalStateException("No configured daemon");
         }
-        daemon.stopNativeTransport();
+        daemon.stopNativeTransport(force);
     }
 
     public boolean isNativeTransportRunning()
@@ -1082,7 +1084,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                           : ((BootstrapAndReplace)sequence).finishJoiningRing().executeNext().isContinuable();
 
         if (!success)
-            throw new RuntimeException(String.format("Could not perform next step of joining the ring {}, " +
+            throw new RuntimeException(String.format("Could not perform next step of joining the ring %s, " +
                                                      "restart this node and inflight operations will attempt to complete. " +
                                                      "If no progress is made, cancel the join process for this node and retry",
                                                      next));
@@ -1091,12 +1093,17 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         InProgressSequences.finishInProgressSequences(id);
     }
 
+    void doAuthSetup()
+    {
+        doAuthSetup(true);
+    }
+
     @VisibleForTesting
-    public void doAuthSetup()
+    public void doAuthSetup(boolean async)
     {
         if (!authSetupCalled.getAndSet(true))
         {
-            DatabaseDescriptor.getRoleManager().setup();
+            DatabaseDescriptor.getRoleManager().setup(async);
             DatabaseDescriptor.getAuthenticator().setup();
             DatabaseDescriptor.getAuthorizer().setup();
             DatabaseDescriptor.getNetworkAuthorizer().setup();
@@ -1609,7 +1616,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                         throw new RuntimeException("Can't abort bootstrap for " + nodeId + " since it is not bootstrapping");
                     ClusterMetadataService.instance().commit(new CancelInProgressSequence(nodeId));
                 }
-                ClusterMetadataService.instance().commit(new Unregister(nodeId));
+                ClusterMetadataService.instance().commit(new Unregister(nodeId, EnumSet.of(REGISTERED, BOOTSTRAPPING, BOOT_REPLACING)));
                 break;
             default:
                 throw new RuntimeException("Can't abort bootstrap for node " + nodeId + " since the state is " + nodeState);
@@ -1971,13 +1978,21 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         Map<Range<Token>, EndpointsForRange> rangeToEndpointMap = new HashMap<>(ranges.size());
         if (null != keyspaceMetadata)
         {
-            TokenMap tokenMap = metadata.tokenMap;
-
-            for (Range<Token> range : ranges)
+            if (keyspaceMetadata.params.replication.isMeta())
             {
-                Token token = tokenMap.nextToken(tokenMap.tokens(), range.right.getToken());
-                rangeToEndpointMap.put(range, metadata.placements.get(keyspaceMetadata.params.replication)
-                                              .reads.forRange(token).get());
+                rangeToEndpointMap.put(MetaStrategy.entireRange,
+                                       metadata.placements.get(keyspaceMetadata.params.replication)
+                                       .reads.forRange(MetaStrategy.entireRange).get());
+            }
+            else
+            {
+                TokenMap tokenMap = metadata.tokenMap;
+                for (Range<Token> range : ranges)
+                {
+                    Token token = tokenMap.nextToken(tokenMap.tokens(), range.right.getToken());
+                    rangeToEndpointMap.put(range, metadata.placements.get(keyspaceMetadata.params.replication)
+                                                  .reads.forRange(token).get());
+                }
             }
         }
         else
@@ -3149,7 +3164,10 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public Pair<Integer, Future<?>> repair(String keyspace, Map<String, String> repairSpec, List<ProgressListener> listeners)
     {
-        RepairOption option = RepairOption.parse(repairSpec, ClusterMetadata.current().partitioner);
+        IPartitioner partitioner = Keyspace.open(keyspace).getMetadata().params.replication.isMeta()
+                                   ? MetaStrategy.partitioner
+                                   : IPartitioner.global();
+        RepairOption option = RepairOption.parse(repairSpec, partitioner);
         return repair(keyspace, option, listeners);
     }
 
@@ -4469,6 +4487,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         List<DecoratedKey> keys = new ArrayList<>();
         for (Keyspace keyspace : Keyspace.nonLocalStrategy())
         {
+            if (keyspace.getMetadata().params.replication.isMeta())
+                continue;
             for (Range<Token> range : getPrimaryRangesForEndpoint(keyspace.getName(), getBroadcastAddressAndPort()))
                 keys.addAll(keySamples(keyspace.getColumnFamilyStores(), range));
         }
@@ -5521,4 +5541,71 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         if (!skipNotificationListeners)
             super.addNotificationListener(listener, filter, handback);
     }
+
+    @Override
+    public double getNativeTransportQueueMaxItemAgeThreshold()
+    {
+        return DatabaseDescriptor.getNativeTransportQueueMaxItemAgeThreshold();
+    }
+
+    @Override
+    public void setNativeTransportQueueMaxItemAgeThreshold(double threshold)
+    {
+        DatabaseDescriptor.setNativeTransportMaxQueueItemAgeThreshold(threshold);
+    }
+
+    @Override
+    public long getNativeTransportMinBackoffOnQueueOverloadInMillis()
+    {
+        return DatabaseDescriptor.getNativeTransportMinBackoffOnQueueOverload(MILLISECONDS);
+    }
+
+    @Override
+    public long getNativeTransportMaxBackoffOnQueueOverloadInMillis()
+    {
+        return DatabaseDescriptor.getNativeTransportMaxBackoffOnQueueOverload(MILLISECONDS);
+    }
+
+    @Override
+    public void setNativeTransportBackoffOnQueueOverloadInMillis(long min, long max)
+    {
+        DatabaseDescriptor.setNativeTransportBackoffOnQueueOverload(min, max, MILLISECONDS);
+    }
+
+    @Override
+    public boolean getNativeTransportThrowOnOverload()
+    {
+        return DatabaseDescriptor.getNativeTransportThrowOnOverload();
+    }
+
+    @Override
+    public void setNativeTransportThrowOnOverload(boolean throwOnOverload)
+    {
+        DatabaseDescriptor.setNativeTransportThrowOnOverload(throwOnOverload);
+    }
+
+    @Override
+    public long getNativeTransportTimeoutMillis()
+    {
+        return DatabaseDescriptor.getNativeTransportTimeout(MILLISECONDS);
+    }
+
+    @Override
+    public void setNativeTransportTimeoutMillis(long deadlineMillis)
+    {
+        DatabaseDescriptor.setNativeTransportTimeout(deadlineMillis, MILLISECONDS);
+    }
+
+    @Override
+    public boolean getEnforceNativeDeadlineForHints()
+    {
+        return DatabaseDescriptor.getEnforceNativeDeadlineForHints();
+    }
+
+    @Override
+    public void setEnforceNativeDeadlineForHints(boolean value)
+    {
+        DatabaseDescriptor.setEnforceNativeDeadlineForHints(value);
+    }
+
 }

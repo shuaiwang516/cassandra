@@ -349,7 +349,7 @@ public class UserType extends TupleType implements SchemaElement
     @Override
     public boolean equals(Object o)
     {
-        if(!(o instanceof UserType))
+        if (o.getClass() != UserType.class)
             return false;
 
         UserType that = (UserType)o;
@@ -500,7 +500,7 @@ public class UserType extends TupleType implements SchemaElement
     }
 
     @Override
-    public String toCqlString(boolean withInternals, boolean ifNotExists)
+    public String toCqlString(boolean withWarnings, boolean withInternals, boolean ifNotExists)
     {
         CqlBuilder builder = new CqlBuilder();
         builder.append("CREATE TYPE ");
