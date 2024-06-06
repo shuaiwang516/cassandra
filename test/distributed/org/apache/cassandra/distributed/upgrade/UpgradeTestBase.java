@@ -18,18 +18,14 @@
 
 package org.apache.cassandra.distributed.upgrade;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.NavigableSet;
-import java.util.Objects;
-import java.util.Set;
+import java.io.File;
+import java.io.IOException;
+import java.util.*;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -97,7 +93,7 @@ public class UpgradeTestBase extends DistributedTestBase
     public static final Semver v50 = new Semver("5.0-alpha1", SemverType.LOOSE);
     public static final Semver v51 = new Semver("5.1-alpha1", SemverType.LOOSE);
 
-    protected static final SimpleGraph<Semver> SUPPORTED_UPGRADE_PATHS = new SimpleGraph.Builder<Semver>()
+    protected static SimpleGraph<Semver> SUPPORTED_UPGRADE_PATHS = new SimpleGraph.Builder<Semver>()
                                                                          .addEdge(v30, v3X)
                                                                          .addEdge(v30, v40)
                                                                          .addEdge(v30, v41)
@@ -110,6 +106,56 @@ public class UpgradeTestBase extends DistributedTestBase
                                                                          .addEdge(v41, v51)
                                                                          //.addEdge(v50, v51)
                                                                          .build();
+
+    static {
+        parseTargetVersionFromFile();
+    }
+
+    /**
+     * Parse the target version pairs from the JSON file
+     * The default file path is "build/versions.json"
+     * The JSON file is expected to be in the following format:
+     * {
+     *    "start-version": ["end-version-1", "end-version-2", ...],
+     *    "4.0-alpha1": ["4.2-alpha1", "5.0-alpha1", "5.1-alpha1"],
+     *    ...
+     * }
+     */
+    private static void parseTargetVersionFromFile() {
+        File targetVersionFile = new File(System.getProperty("cassandra.test.dtest_jar_path", "build"), "versions.json");
+        if (targetVersionFile.exists()) {
+            try {
+                // Read the target version pairs from the JSON file
+                ObjectMapper mapper = new ObjectMapper();
+                JsonNode rootNode = mapper.readTree(targetVersionFile);
+                Iterator<Map.Entry<String, JsonNode>> fieldsIterator = rootNode.fields();
+                Map<String, String[]> targetVersionPairs = new HashMap<>();
+
+                // Iterate through the target version pairs and build the target version map
+                while (fieldsIterator.hasNext()) {
+                    Map.Entry<String, JsonNode> field = fieldsIterator.next();
+                    String key = field.getKey();
+                    JsonNode valueNode = field.getValue();
+
+                    String[] values = mapper.convertValue(valueNode, String[].class);
+                    targetVersionPairs.put(key, values);
+                }
+
+                // Build the supported upgrade paths from the target version pairs
+                SimpleGraph.Builder<Semver> builder = new SimpleGraph.Builder<Semver>();
+                for (Map.Entry<String, String[]> entry : targetVersionPairs.entrySet()) {
+                    Semver from = new Semver(entry.getKey(), SemverType.LOOSE);
+                    for (String to : entry.getValue()) {
+                        builder.addEdge(from, new Semver(to, SemverType.LOOSE));
+                    }
+                }
+                SUPPORTED_UPGRADE_PATHS = builder.build();
+            } catch (IOException e) {
+                throw new RuntimeException("Error reading target version pairs from " + targetVersionFile, e);
+            }
+        }
+        // Else use the default supported upgrade paths
+    }
 
     // the last is always the current
     public static final Semver CURRENT = SimpleGraph.max(SUPPORTED_UPGRADE_PATHS);
